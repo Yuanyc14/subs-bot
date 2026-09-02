@@ -123,6 +123,13 @@ class Store:
     async def update_sub(self, user_id: int, sub_id: int, **fields: Any) -> dict[str, Any] | None:
         if not fields:
             return await self.get_sub(user_id, sub_id)
+        allowed = {
+            "name", "url", "token", "expire_at", "traffic_used",
+            "traffic_total", "nodes_json", "last_error", "created_at",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unsupported subscription fields: {sorted(unknown)}")
         fields["updated_at"] = int(time.time())
         cols = ", ".join(f"{k}=?" for k in fields)
         vals = list(fields.values()) + [user_id, sub_id]
@@ -207,30 +214,31 @@ class Store:
         return subs[-1] if subs else None
 
     async def renumber(self, user_id: int) -> int:
-        subs = await self.list_subs(user_id)
+        # Display numbers are derived from ORDER BY id; never rewrite rows here.
+        # Re-inserting would invalidate callback IDs and unnecessarily risk data loss.
+        return len(await self.list_subs(user_id))
+
+    async def add_imported_sub(
+        self, user_id: int, name: str, nodes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        token = secrets.token_urlsafe(12)
+        local_url = f"uploaded://{secrets.token_urlsafe(8)}"
         async with self.connection() as db:
-            await db.execute("DELETE FROM subscriptions WHERE user_id=?", (user_id,))
-            for sub in subs:
-                await db.execute(
-                    """INSERT INTO subscriptions
-                    (user_id,name,url,token,expire_at,traffic_used,traffic_total,nodes_json,last_error,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        user_id,
-                        sub["name"],
-                        sub["url"],
-                        sub["token"],
-                        sub["expire_at"],
-                        sub["traffic_used"],
-                        sub["traffic_total"],
-                        sub["nodes_json"],
-                        sub["last_error"],
-                        sub["created_at"],
-                        int(time.time()),
-                    ),
-                )
+            cur = await db.execute(
+                """INSERT INTO subscriptions
+                (user_id,name,url,token,expire_at,traffic_used,traffic_total,nodes_json,created_at,updated_at)
+                VALUES (?,?,?,?,NULL,NULL,NULL,?,?,?)""",
+                (
+                    user_id, name[:64] or "导入配置", local_url, token,
+                    json.dumps(nodes, ensure_ascii=False), now, now,
+                ),
+            )
             await db.commit()
-        return len(subs)
+            sub_id = int(cur.lastrowid)
+        sub = await self.get_sub(user_id, sub_id)
+        assert sub is not None
+        return sub
 
     async def list_path_maps(self, user_id: int) -> list[dict[str, Any]]:
         async with self.connection() as db:

@@ -7,7 +7,7 @@ import logging
 import re
 from contextlib import suppress
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -21,7 +21,16 @@ from telegram.ext import (
     filters,
 )
 
-from config import ALLOWED_USER_IDS, BOT_TOKEN, HTTP_HOST, HTTP_PORT, PUBLIC_BASE_URL
+from config import (
+    ALLOWED_USER_IDS,
+    BOT_TOKEN,
+    HTTP_HOST,
+    HTTP_PORT,
+    MAX_DOCUMENT_BYTES,
+    MAX_IMPORTED_NODES,
+    MAX_IMPORTED_SUBSCRIPTIONS,
+    PUBLIC_BASE_URL,
+)
 from convert import (
     apply_path_maps,
     extract_share_links,
@@ -29,6 +38,7 @@ from convert import (
     format_bytes_gb,
     format_expire,
     node_name_from_url,
+    parse_nodes_from_text,
     remain_text,
     to_base64_sub,
     to_clash,
@@ -44,6 +54,27 @@ log = logging.getLogger("subs-bot")
 
 store = Store()
 
+ALLOWED_DOCUMENT_SUFFIXES = frozenset({".txt", ".log", ".yaml", ".yml", ".json"})
+
+
+def _document_suffix(filename: str) -> str:
+    name = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+
+
+def _decode_document(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def _unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["📋 订阅列表", "🟠 临期列表"],
@@ -58,7 +89,7 @@ HELP_TEXT = (
     "📌 支持直接发送任意数量的订阅链接\n"
     "📄 支持上传 .txt / .log / .yaml / .yml 自动识别订阅和节点\n"
     "♻️ 支持在回收站中恢复最近 30 天删除的订阅\n"
-    "🔗 支持导出链接、短链、Clash / Sing-box / Base64\n\n"
+    "🔗 支持导出链接、短链、Clash / Sing-box / Base64 / Surge / QX\n\n"
     "<b>命令</b>\n"
     "/start 主菜单\n"
     "/list 订阅列表\n"
@@ -469,15 +500,6 @@ async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html("\n\n".join(lines), reply_markup=MAIN_KB)
 
 
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await deny(update):
-        return
-    await update.effective_message.reply_text(
-        "🤖 批量测试占位：后续可接延迟/可用性探测。当前请先用刷新订阅。",
-        reply_markup=MAIN_KB,
-    )
-
-
 async def show_detail(update: Update, user_id: int, idx: int, page: int = 0) -> None:
     subs = await store.list_subs(user_id)
     if idx < 1 or idx > len(subs):
@@ -588,6 +610,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "未识别内容。可发送订阅链接、节点链接，或点击帮助菜单。",
         reply_markup=MAIN_KB,
     )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    message = update.effective_message
+    document = message.document
+    filename = (document.file_name or "upload.txt").strip() or "upload.txt"
+    suffix = _document_suffix(filename)
+    if suffix not in ALLOWED_DOCUMENT_SUFFIXES:
+        await message.reply_text("不支持的文件类型。请上传 .txt、.log、.yaml、.yml 或 .json 文件。", reply_markup=MAIN_KB)
+        return
+    if document.file_size and document.file_size > MAX_DOCUMENT_BYTES:
+        await message.reply_text(f"文件过大，最大支持 {MAX_DOCUMENT_BYTES // 1024 // 1024} MB。", reply_markup=MAIN_KB)
+        return
+    status = await message.reply_text("正在读取文件…")
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        raw = bytes(await telegram_file.download_as_bytearray())
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            await status.edit_text("文件过大，下载后超过大小限制。")
+            return
+        text = _decode_document(raw)
+    except Exception:
+        log.exception("document download failed")
+        await status.edit_text("文件读取失败，请稍后重试。")
+        return
+
+    user_id = update.effective_user.id
+    existing_urls = {sub["url"] for sub in await store.list_subs(user_id)}
+    parsed_nodes = parse_nodes_from_text(text)
+    structured = bool(parsed_nodes and ("proxies:" in text or "outbounds" in text))
+    created: list[tuple[str, int]] = []
+    failures: list[str] = []
+    skipped = 0
+    temp_count = 0
+
+    if structured:
+        name = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0][:64] or "导入配置"
+        local = await store.add_imported_sub(user_id, name, parsed_nodes[:MAX_IMPORTED_NODES])
+        created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
+    else:
+        urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
+        for url in urls[:MAX_IMPORTED_SUBSCRIPTIONS]:
+            if url in existing_urls:
+                skipped += 1
+                continue
+            name = urlparse(url).netloc or "订阅"
+            try:
+                sub = await store.add_sub(user_id, name, url)
+                updated = await refresh_sub(user_id, sub, rename=True)
+                if updated.get("last_error"):
+                    failures.append(f"{name}: {updated["last_error"]}")
+                else:
+                    created.append((str(updated.get("name") or name), len(nodes_of(updated))))
+            except Exception as exc:
+                failures.append(f"{name}: {exc}")
+        links = _unique(extract_share_links(text))[:MAX_IMPORTED_NODES]
+        for link in links:
+            await store.add_temp(user_id, link, node_name_from_url(link))
+        temp_count = len(links)
+
+    lines = [f"✅ 已处理文件：{html.escape(filename)}"]
+    for name, count in created:
+        lines.append(f"已添加：{html.escape(name)}（{count} 节点）")
+    if temp_count:
+        lines.append(f"已加入临时节点：{temp_count} 条")
+    if skipped:
+        lines.append(f"已跳过重复订阅：{skipped} 条")
+    if failures:
+        lines.append("失败：" + "；".join(html.escape(item) for item in failures[:8]))
+    if not created and not temp_count and not failures and not skipped:
+        lines.append("未识别到订阅或节点内容。")
+    await status.edit_text("\n".join(lines), reply_markup=MAIN_KB, parse_mode=ParseMode.HTML)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -775,6 +871,8 @@ async def http_short(request: web.Request) -> web.Response:
     target = row["target_url"]
     if target.startswith("aggregate://"):
         raise web.HTTPFound(f"/agg/{row['user_id']}/clash")
+    if not target.startswith(("http://", "https://")):
+        return web.Response(status=400, text="invalid target")
     raise web.HTTPFound(target)
 
 
@@ -809,8 +907,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("renumber", cmd_renumber))
     app.add_handler(CommandHandler("s", cmd_search))
     app.add_handler(CommandHandler("temp", cmd_temp))
-    app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 

@@ -15,6 +15,16 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
+def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)).strip())
+    except ValueError:
+        return default
+    if value < minimum:
+        return default
+    return min(value, maximum) if maximum is not None else value
+
+
 ROOT = Path(__file__).resolve().parent
 _load_dotenv(ROOT / ".env")
 
@@ -29,4 +39,7 @@ HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8787"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT / "data")))
 DB_PATH = Path(os.environ.get("DB_PATH", str(DATA_DIR / "subs.db")))
+MAX_DOCUMENT_BYTES = _env_int("MAX_DOCUMENT_BYTES", 10 * 1024 * 1024, 1, 50 * 1024 * 1024)
+MAX_IMPORTED_NODES = _env_int("MAX_IMPORTED_NODES", 500, 1, 5000)
+MAX_IMPORTED_SUBSCRIPTIONS = _env_int("MAX_IMPORTED_SUBSCRIPTIONS", 20, 1, 100)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
