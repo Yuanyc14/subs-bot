@@ -12,9 +12,8 @@ from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputFile, Update
 from telegram.constants import ParseMode
-from telegram.file import InputFile
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
