@@ -10,6 +10,7 @@ from contextlib import suppress
 from typing import Any
 from urllib.parse import urlparse
 
+import aiohttp
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -285,8 +286,14 @@ async def refresh_sub(user_id: int, sub: dict[str, Any], rename: bool = False) -
     return updated or sub
 
 
-async def render_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") -> tuple[str, InlineKeyboardMarkup]:
     subs = await store.list_subs(user_id)
+    if sort_mode == "流量":
+        subs.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
+    elif sort_mode == "到期":
+        subs.sort(key=lambda s: s.get("expire_at") or 99999999999)
+    elif sort_mode == "名称":
+        subs.sort(key=lambda s: str(s.get("name") or ""))
     page_size = 8
     if not subs:
         return "📋 暂无订阅\n\n直接发送订阅链接即可添加。", InlineKeyboardMarkup(
@@ -296,7 +303,7 @@ async def render_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardM
     start = page * page_size
     chunk = subs[start : start + page_size]
     items = [(start + i, sub) for i, sub in enumerate(chunk, start=1)]
-    text = f"📋 <b>订阅列表</b>（共 {len(subs)} 个）\n点击下方按钮查看详情。"
+    text = f"📋 <b>订阅列表</b> 共{len(subs)}个｜第{page + 1}/{(len(subs) - 1) // page_size + 1}页\n点击下方按钮查看详情。"
     return text, list_keyboard(page, len(subs), page_size, items)
 
 
@@ -557,9 +564,23 @@ async def cmd_delete_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    mode = " ".join(context.args or []).strip() or "默认"
+    args = " ".join(context.args or []).strip()
+    if args:
+        valid_modes = {"默认", "流量", "到期", "名称"}
+        if args not in valid_modes:
+            await update.effective_message.reply_text(
+                f"❌ 不支持的排序方式：{args}\n可选：{' / '.join(sorted(valid_modes))}", reply_markup=MAIN_KB
+            )
+            return
+        if context.user_data is not None:
+            context.user_data["sort_mode"] = args
+        await update.effective_message.reply_text(f"✅ 内联排序已切换为：{args}", reply_markup=MAIN_KB)
+        return
+    if context.user_data is not None:
+        context.user_data["await"] = "inline_sort"
+    current = (context.user_data or {}).get("sort_mode", "默认")
     await update.effective_message.reply_text(
-        f"✅ 内联排序已切换：{mode}\n当前版本暂支持订阅列表和详情内联查询。",
+        f"当前排序：{current}\n请发送新的排序方式（默认 / 流量 / 到期 / 名称）。",
         reply_markup=MAIN_KB,
     )
 
@@ -567,6 +588,8 @@ async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_api_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
+    if context.user_data is not None:
+        context.user_data["await"] = "api_test"
     await update.effective_message.reply_text(
         "🧪 API 批量测试\n请发送要测试的 API 地址和 Key，每行一组：\n地址|Key",
         reply_markup=MAIN_KB,
@@ -654,6 +677,79 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = (update.effective_message.text or "").strip()
     user_id = update.effective_user.id
     if not text:
+        return
+
+    # ── 页码跳转状态机 ──────────────────────────────
+    state = context.user_data.get("await") if context.user_data else None
+    if state == "list_jump":
+        context.user_data.pop("await", None)
+        if not text.isdigit():
+            await update.effective_message.reply_text("❌ 页码必须是数字，已取消跳转。", reply_markup=MAIN_KB)
+            return
+        page = int(text) - 1
+        if page < 0:
+            page = 0
+        subs_total = len(await store.list_subs(user_id))
+        max_page = max(0, (subs_total - 1) // 8)
+        if page > max_page:
+            await update.effective_message.reply_text(
+                f"❌ 页码超出范围（最大 {max_page + 1}），已取消。", reply_markup=MAIN_KB
+            )
+            return
+        text_out, kb = await render_list(user_id, page)
+        await update.effective_message.reply_html(text_out, reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    # ── /ai API 测试状态机 ─────────────────────────
+    if state == "api_test":
+        context.user_data.pop("await", None)
+        results = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            api_url, _, key = line.partition("|")
+            api_url = api_url.strip()
+            key = key.strip()
+            if not api_url or not key:
+                results.append(f"⚠️ 格式错误：{line[:40]}")
+                continue
+            t0 = time.time()
+            try:
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        api_url,
+                        headers={"Authorization": f"Bearer {key}"},
+                    ) as resp:
+                        elapsed = time.time() - t0
+                        status = resp.status
+                        body_snippet = (await resp.text())[:80].replace("\n", " ")
+                if status == 200:
+                    results.append(f"✅ {api_url} → {status} ({elapsed:.1f}s) {body_snippet}")
+                else:
+                    results.append(f"❌ {api_url} → {status} ({elapsed:.1f}s) {body_snippet}")
+            except Exception as exc:
+                elapsed = time.time() - t0
+                results.append(f"❌ {api_url} → {type(exc).__name__} ({elapsed:.1f}s)")
+        if not results:
+            await update.effective_message.reply_text("未解析到任何 地址|Key 组。", reply_markup=MAIN_KB)
+            return
+        await update.effective_message.reply_text("\n".join(results[:20]), reply_markup=MAIN_KB)
+        return
+
+    # ── 内联排序状态机 ─────────────────────────────
+    if state == "inline_sort":
+        context.user_data.pop("await", None)
+        mode = text.strip()
+        valid_modes = {"默认", "流量", "到期", "名称"}
+        if mode not in valid_modes:
+            await update.effective_message.reply_text(
+                f"❌ 不支持的排序方式：{mode}\n可选：{' / '.join(sorted(valid_modes))}", reply_markup=MAIN_KB
+            )
+            return
+        context.user_data["sort_mode"] = mode
+        await update.effective_message.reply_text(f"✅ 内联排序已切换为：{mode}", reply_markup=MAIN_KB)
         return
 
     if text in ("📦 订阅列表", "📋 订阅列表", "订阅列表"):
@@ -832,6 +928,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.message.reply_text("🏠 主菜单", reply_markup=MAIN_KB)
         return
     if data == "list:jump":
+        if context.user_data is not None:
+            context.user_data["await"] = "list_jump"
         await q.message.reply_text("🔢 请输入要跳转的页码数字（如 2）。")
         return
     if data == "list:updateall":
