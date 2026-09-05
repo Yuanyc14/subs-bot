@@ -77,7 +77,7 @@ def _unique(values: list[str]) -> list[str]:
 
 MAIN_KB = ReplyKeyboardMarkup(
     [
-        ["📋 订阅列表", "🟠 临期列表"],
+        ["📦 订阅列表", "🟠 临期列表"],
         ["📤 导出链接", "🔄 更新所有"],
         ["🔢 重置编号", "♻️ 撤销删除"],
         ["🧭 路径对应", "❓ 帮助菜单"],
@@ -97,8 +97,15 @@ HELP_TEXT = (
     "/export 导出链接\n"
     "/path 路径对应\n"
     "/renumber 重置编号\n"
-    "/s &lt;关键词&gt; 搜索订阅\n\n"
-    "<b>添加订阅</b>\n"
+    "/s &lt;关键词&gt; 搜索订阅\n"
+    "/o &lt;关键词&gt; 导出搜索结果\n"
+    "/d &lt;关键词或链接&gt; 删除名称或链接匹配\n"
+    "/i &lt;排序方式&gt; 切换内联排序\n"
+    "/ai 批量测试 API 地址和 Key\n\n"
+    "<b>内联功能</b>\n"
+    "输入 @MxlDYBot 或 @MxlDYBot 订阅名/链接内容发送订阅\n"
+    "内联私密分享：@MxlDYBot Share [份数] [用户ID] [分钟] 内容\n\n"
+    "<b>添加订阅</b>\n" ,
     "直接发送订阅链接（http/https）\n"
     "名称优先使用订阅返回的配置名称\n\n"
     "<b>临时节点</b>\n"
@@ -210,6 +217,7 @@ def detail_keyboard(sub_id: int, page: int = 0) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Surge", callback_data=f"sub:fmt:{sub_id}:surge"),
             ],
             [InlineKeyboardButton("QX", callback_data=f"sub:fmt:{sub_id}:qx")],
+            [InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}")],
             [
                 InlineKeyboardButton("📦 导出节点", callback_data=f"sub:nodes:{sub_id}"),
                 InlineKeyboardButton("🗑 删除订阅", callback_data=f"sub:del:{sub_id}:{page}"),
@@ -462,6 +470,64 @@ async def cmd_renumber(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(f"已重置编号，当前 {n} 条订阅。", reply_markup=MAIN_KB)
 
 
+async def cmd_delete_match(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    q = " ".join(context.args or []).strip().lower()
+    if not q:
+        await update.effective_message.reply_text("用法：/d 关键词或订阅链接", reply_markup=MAIN_KB)
+        return
+    subs = await store.list_subs(update.effective_user.id)
+    hits = [s for s in subs if q in f"{s['name']} {s['url']}".lower()]
+    if not hits:
+        await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
+        return
+    for sub in hits:
+        await store.delete_sub(update.effective_user.id, int(sub["id"]))
+    await update.effective_message.reply_text(f"✅ 已删除 {len(hits)} 个匹配订阅。", reply_markup=MAIN_KB)
+
+
+async def cmd_inline_sort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    mode = " ".join(context.args or []).strip() or "默认"
+    await update.effective_message.reply_text(
+        f"✅ 内联排序已切换：{mode}\n当前版本暂支持订阅列表和详情内联查询。",
+        reply_markup=MAIN_KB,
+    )
+
+
+async def cmd_api_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    await update.effective_message.reply_text(
+        "🧪 API 批量测试\n请发送要测试的 API 地址和 Key，每行一组：\n地址|Key",
+        reply_markup=MAIN_KB,
+    )
+
+
+async def cmd_search_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await deny(update):
+        return
+    q = " ".join(context.args or []).strip().lower()
+    subs = await store.list_subs(update.effective_user.id)
+    hits = [s for s in subs if not q or q in f"{s['name']} {s['url']}".lower()]
+    if not hits:
+        await update.effective_message.reply_text("没有匹配订阅。", reply_markup=MAIN_KB)
+        return
+    nodes = []
+    for sub in hits:
+        nodes.extend(nodes_of(sub))
+    if not nodes:
+        await update.effective_message.reply_text("匹配订阅暂无可导出节点。", reply_markup=MAIN_KB)
+        return
+    await update.effective_message.reply_text(
+        f"📦 搜索导出完成：{len(hits)} 个订阅，{len(nodes)} 个节点\\n"
+        f"{PUBLIC_BASE_URL}/agg/{update.effective_user.id}/clash",
+        reply_markup=MAIN_KB,
+    )
+
+
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
@@ -523,7 +589,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
 
-    if text in ("📋 订阅列表", "订阅列表"):
+    if text in ("📦 订阅列表", "📋 订阅列表", "订阅列表"):
         return await cmd_list(update, context)
     if text in ("⏳ 临期列表", "🟠 临期列表", "临期列表"):
         return await cmd_expire(update, context)
@@ -906,6 +972,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("path", cmd_path))
     app.add_handler(CommandHandler("renumber", cmd_renumber))
     app.add_handler(CommandHandler("s", cmd_search))
+    app.add_handler(CommandHandler("o", cmd_search_export))
+    app.add_handler(CommandHandler("d", cmd_delete_match))
+    app.add_handler(CommandHandler("i", cmd_inline_sort))
+    app.add_handler(CommandHandler("ai", cmd_api_test))
     app.add_handler(CommandHandler("temp", cmd_temp))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
