@@ -305,12 +305,34 @@ async def fetch_subscription(url: str, timeout: int = 25) -> tuple[list[dict[str
 
 
 def apply_path_maps(nodes: list[dict[str, Any]], maps: dict[str, str]) -> list[dict[str, Any]]:
-    out = []
-    for n in nodes:
-        item = dict(n)
+    """Apply path rules by case-insensitive substring matching.
+
+    The longest keyword wins, so a specific rule such as ``hk-premium`` is
+    evaluated before a broader rule such as ``hk``.  Besides the displayed node
+    name, the server and share URL are searched because many subscriptions put
+    the provider/path only in one of those fields.
+    """
+    rules = sorted(
+        [
+            (str(keyword).strip().casefold(), str(remark).strip())
+            for keyword, remark in maps.items()
+            if str(keyword).strip() and str(remark).strip()
+        ],
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        item = dict(node)
         name = str(item.get("name") or "")
-        if name in maps and maps[name]:
-            item["name"] = f"{name} → {maps[name]}"
+        haystack = " ".join(
+            str(item.get(field) or "")
+            for field in ("name", "server", "share")
+        ).casefold()
+        for keyword, remark in rules:
+            if keyword in haystack:
+                item["name"] = f"{name} → {remark}"
+                break
         out.append(item)
     return out
 

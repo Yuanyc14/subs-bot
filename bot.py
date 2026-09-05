@@ -8,7 +8,7 @@ import re
 import time
 from contextlib import suppress
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -35,6 +35,8 @@ from telegram.ext import (
 from config import (
     ALLOWED_USER_IDS,
     BOT_TOKEN,
+    BOT_USERNAME,
+    GITHUB_TOKEN,
     HTTP_HOST,
     HTTP_PORT,
     MAX_DOCUMENT_BYTES,
@@ -98,25 +100,18 @@ MAIN_KB = ReplyKeyboardMarkup(
 
 HELP_TEXT = (
     "📌 支持直接发送任意数量的订阅链接\n"
-    "📄 支持上传 .txt / .log / .yaml / .yml 自动识别订阅和节点\n"
+    "📄 支持上传 <code>.txt</code> / <code>.log</code> / <code>.yaml</code> / <code>.yml</code> 文本文档自动识别订阅链接和节点\n"
     "♻️ 支持在回收站中恢复最近 30 天删除的订阅\n"
-    "🔗 支持导出链接、短链、Clash / Sing-box / Base64 / Surge / QX\n\n"
-    "<b>命令</b>\n"
-    "/start 主菜单\n"
-    "/list 订阅列表\n"
-    "/expire 临期列表\n"
-    "/export 导出链接\n"
-    "/path 路径对应\n"
-    "/renumber 重置编号\n"
+    "🤖 支持直接发送 <code>API 地址 + KEY</code> 测试 OpenAI 兼容接口可用性\n\n"
     "/s &lt;关键词&gt; 搜索订阅\n"
+    "/g &lt;关键词或链接&gt; 搜索 GitHub 公开代码\n"
     "/o &lt;关键词&gt; 导出搜索结果\n"
-    "/d &lt;关键词或链接&gt; 删除名称或链接匹配\n"
+    "/d &lt;关键词或链接&gt; 删除名称或链接匹配的订阅\n"
     "/i &lt;排序方式&gt; 切换内联排序\n"
     "/ai 批量测试 API 地址和 Key\n\n"
-    "<b>内联功能</b>\n"
-    "输入 @MxlDYBot 或 @MxlDYBot 订阅名/链接内容发送订阅\n"
-    "内联私密分享：@MxlDYBot Share [份数] [用户ID] [分钟] 内容\n\n"
-    "<b>添加订阅</b>\n" ,
+    f"内联发送订阅：输入 @{BOT_USERNAME} 或 @{BOT_USERNAME} 订阅名或链接内容\n"
+    f"内联私密分享：输入 @{BOT_USERNAME} Share [x份数] [id用户ID] [s分钟] 分享内容\n\n"
+    "<b>添加订阅</b>\n"
     "直接发送订阅链接（http/https）\n"
     "名称优先使用订阅返回的配置名称\n\n"
     "<b>临时节点</b>\n"
@@ -124,8 +119,8 @@ HELP_TEXT = (
     "/temp - 查看临时节点\n"
     "/temp clear - 清空临时节点\n\n"
     "<b>路径对应</b>\n"
-    "格式：节点名=备注\n"
-    "清空：节点名=\n"
+    "格式：路径关键词 空格 配置名称\n"
+    "例如：liangxinyun 良心云\n"
     "/path clear - 清空全部\n\n"
     "发送数字编号可查看订阅详情。"
 )
@@ -168,14 +163,39 @@ def remain_traffic_gb(sub: dict[str, Any]) -> float | None:
 
 def list_button_label(idx: int, sub: dict[str, Any]) -> str:
     remain = remain_traffic_gb(sub)
-    remain_s = f"{remain:.2f}GB" if remain is not None else "?GB"
-    days = remain_text(sub.get("expire_at"))
-    if days == "长期有效":
-        days = "长期"
-    elif days.endswith("小时") and "天" in days:
-        days = days.split("天", 1)[0] + "天"
-    name = str(sub.get("name") or "未命名")
-    label = f"#{idx} {name} [{remain_s}] {days}"
+    remain_s = f"{remain:.2f} GB" if remain is not None else "? GB"
+    exp = sub.get("expire_at")
+    now = int(time.time())
+    if exp is None or exp <= 0:
+        days = "未知"
+        is_expired = False
+        is_soon = False
+    else:
+        delta = exp - now
+        if delta < 0:
+            days = "已过期"
+            is_expired = True
+            is_soon = False
+        elif delta > 10 * 365 * 86400:
+            days = "长期"
+            is_expired = False
+            is_soon = False
+        else:
+            days_num = max(0, delta // 86400)
+            days = f"{days_num}天"
+            is_expired = False
+            is_soon = 0 <= delta <= 14 * 86400
+
+    is_drained = remain is not None and remain <= 0.001
+    if is_expired or is_drained:
+        status_icon = "🔴"
+    elif is_soon:
+        status_icon = "🟠"
+    else:
+        status_icon = "🟢"
+
+    name = str(sub.get("name") or "未命名").strip()
+    label = f"{status_icon}#{idx} {name} [{remain_s}] {days}"
     return label[:64]
 
 
@@ -303,15 +323,21 @@ async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") ->
     elif sort_mode == "名称":
         subs.sort(key=lambda s: str(s.get("name") or ""))
     page_size = 8
+    now = int(time.time())
+    soon_count = sum(
+        1 for s in subs
+        if s.get("expire_at") and 0 <= s["expire_at"] - now <= 14 * 86400
+    )
     if not subs:
-        return "📋 暂无订阅\n\n直接发送订阅链接即可添加。", InlineKeyboardMarkup(
+        return "📁 <b>订阅列表为空</b>\n\n直接发送订阅链接即可添加。", InlineKeyboardMarkup(
             [[InlineKeyboardButton("🏠 主菜单", callback_data="list:home")]]
         )
-    page = max(0, min(page, (len(subs) - 1) // page_size))
+    total_pages = max(1, (len(subs) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
     start = page * page_size
     chunk = subs[start : start + page_size]
     items = [(start + i, sub) for i, sub in enumerate(chunk, start=1)]
-    text = f"📋 <b>订阅列表</b> 共{len(subs)}个｜第{page + 1}/{(len(subs) - 1) // page_size + 1}页\n点击下方按钮查看详情。"
+    text = f"📁 <b>订阅列表 共{len(subs)}个 | 🟠{soon_count}个临期 | 第{page + 1}/{total_pages}页</b>"
     return text, list_keyboard(page, len(subs), page_size, items)
 
 
@@ -332,7 +358,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    await update.effective_message.reply_html(HELP_TEXT, reply_markup=MAIN_KB)
+    await update.effective_message.reply_html(HELP_TEXT, reply_markup=MAIN_KB, disable_web_page_preview=True)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -355,17 +381,18 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if 0 <= exp - now <= 14 * 86400:
             soon.append((i, sub))
     if not soon:
+        nav = [[
+            InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+            InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+        ]]
         await update.effective_message.reply_text(
-            "🟠 临期列表为空，当前没有 14 天内到期的订阅",
-            reply_markup=MAIN_KB,
+            "🟠 临期列表为空，当前没有 14 天内到期的订阅。",
+            reply_markup=InlineKeyboardMarkup(nav),
         )
         return
-    lines = [f"🟠 <b>临期列表</b> 共{len(soon)}个｜第1/1页\n"]
-    for i, sub in soon:
-        remain = remain_traffic_gb(sub)
-        remain_s = f"{remain:.2f} GB" if remain is not None else "? GB"
-        lines.append(f"🟠 #{i} {html.escape(sub['name'])} [{remain_s}] {html.escape(remain_text(sub.get('expire_at')))}")
-    await update.effective_message.reply_html("\n".join(lines), reply_markup=MAIN_KB)
+    text = f"🟠 <b>临期列表 共{len(soon)}个 | 第1/1页</b>"
+    kb = list_keyboard(0, len(soon), 8, soon)
+    await update.effective_message.reply_html(text, reply_markup=kb)
 
 
 async def cmd_update_all_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,10 +448,7 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for name, content in files:
         doc = InputFile(content.encode("utf-8"), filename=name)
         await context.bot.send_document(chat_id=user_id, document=doc)
-    stats = (
-        f"📊 更新完成\n有效: {len(valid)}\n耗尽: {len(drained)}\n"
-        f"过期: {len(expired)}\n失败: {len(failed)}"
-    )
+    stats = f"有效:{len(valid)} | 耗尽:{len(drained)} | 过期:{len(expired)} | 失败:{len(failed)}"
     if failed:
         keyboard = InlineKeyboardMarkup([
             [
@@ -443,6 +467,8 @@ async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     else:
         await context.bot.send_message(chat_id=user_id, text=stats, reply_markup=MAIN_KB)
+        text_list, kb_list = await render_list(user_id, 0)
+        await context.bot.send_message(chat_id=user_id, text=text_list, reply_markup=kb_list, parse_mode=ParseMode.HTML)
 
 
 async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -523,6 +549,51 @@ async def cmd_short(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+PATH_ADD_PROMPT = "请输入 路径关键词 空格 配置名称\n例如：liangxinyun 良心云"
+
+
+def parse_path_rule(raw: str) -> tuple[str, str] | None:
+    """Parse target syntax ``keyword name`` while retaining ``keyword=name`` compatibility."""
+    raw = " ".join(raw.split()).strip()
+    if not raw:
+        return None
+    if "=" in raw and not raw.lower().startswith(("http://", "https://")):
+        keyword, remark = raw.split("=", 1)
+    else:
+        parts = raw.split(None, 1)
+        if len(parts) != 2:
+            return None
+        keyword, remark = parts
+    keyword = keyword.strip()
+    remark = remark.strip()
+    if not keyword or not remark or len(keyword) > 128 or len(remark) > 128:
+        return None
+    return keyword, remark
+
+
+def path_keyboard(maps: list[dict[str, Any]] | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for row in maps or []:
+        label = f"🗑 {row['node_name']} → {row['remark']}"[:64]
+        rows.append([InlineKeyboardButton(label, callback_data=f"path:delete:{int(row['id'])}")])
+    rows.append([InlineKeyboardButton("➕ 添加对应", callback_data="path:add")])
+    rows.append([InlineKeyboardButton("🏠 主菜单", callback_data="list:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def render_path_page(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    maps = await store.list_path_maps(user_id)
+    if not maps:
+        return (
+            "🧭 <b>路径对应为空</b>\n\n点击下方按钮即可新增一条路径对应规则。",
+            path_keyboard(),
+        )
+    lines = [f"🧭 <b>路径对应</b>（{len(maps)}）\n"]
+    for row in maps:
+        lines.append(f"• <code>{html.escape(row['node_name'])}</code> → {html.escape(row['remark'])}")
+    return "\n".join(lines), path_keyboard(maps)
+
+
 async def cmd_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
@@ -530,19 +601,17 @@ async def cmd_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if args and args[0].lower() == "clear":
         n = await store.clear_path_maps(user_id)
-        await update.effective_message.reply_text(f"已清空 {n} 条路径对应。", reply_markup=MAIN_KB)
+        text, kb = await render_path_page(user_id)
+        await update.effective_message.reply_html(f"✅ 已清空 {n} 条路径对应。\n\n{text}", reply_markup=kb)
         return
-    maps = await store.list_path_maps(user_id)
-    if not maps:
-        await update.effective_message.reply_text(
-            "🧭 暂无路径对应\n发送：节点名=备注\n清空某条：节点名=",
-            reply_markup=MAIN_KB,
-        )
-        return
-    lines = ["🧭 <b>路径对应</b>\n"]
-    for m in maps:
-        lines.append(f"• <code>{html.escape(m['node_name'])}</code> = {html.escape(m['remark'])}")
-    await update.effective_message.reply_html("\n".join(lines), reply_markup=MAIN_KB)
+    if args:
+        rule = parse_path_rule(" ".join(args))
+        if rule is None:
+            await update.effective_message.reply_text(PATH_ADD_PROMPT)
+            return
+        await store.upsert_path_map(user_id, *rule)
+    text, kb = await render_path_page(user_id)
+    await update.effective_message.reply_html(text, reply_markup=kb)
 
 
 async def cmd_renumber(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -645,6 +714,64 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_html("🔍 搜索结果\n\n" + "\n\n".join(hits), reply_markup=MAIN_KB)
 
 
+async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search public GitHub code, with grep.app fallback for unauthenticated limits."""
+    if await deny(update):
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.effective_message.reply_text("用法：/g 关键词或链接", reply_markup=MAIN_KB)
+        return
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "subs-bot"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    results: list[dict[str, Any]] = []
+    source = "GitHub"
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            url = "https://api.github.com/search/code?q=" + quote_plus(query) + "&per_page=10"
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    payload = await resp.json(content_type=None)
+                    results = payload.get("items") or []
+                elif resp.status not in (401, 403, 422):
+                    log.warning("GitHub code search HTTP %s", resp.status)
+            if not results:
+                source = "grep.app"
+                async with session.get(
+                    "https://grep.app/api/search?q=" + quote_plus(query) + "&regexp=false"
+                ) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json(content_type=None)
+                        results = payload.get("hits", {}).get("hits", [])
+    except Exception as exc:
+        log.warning("code search failed: %s", exc)
+    if not results:
+        await update.effective_message.reply_text("没有找到公开代码，或搜索服务暂时不可用。", reply_markup=MAIN_KB)
+        return
+    lines = [f"🔎 <b>GitHub 代码搜索</b>（{source}）\n关键词：<code>{html.escape(query)}</code>\n"]
+    for item in results[:10]:
+        if source == "GitHub":
+            repo = item.get("repository") or {}
+            full_name = repo.get("full_name") or "unknown"
+            path = item.get("path") or ""
+            html_url = item.get("html_url") or ""
+        else:
+            repo = item.get("repo") or {}
+            full_name = repo.get("raw") or repo.get("name") or "unknown"
+            path = item.get("path") or ""
+            html_url = item.get("content", {}).get("url") or (
+                f"https://github.com/{full_name}/blob/HEAD/{path}" if path else ""
+            )
+        title = f"{full_name}/{path}" if path else full_name
+        if html_url:
+            lines.append(f"• <a href=\"{html.escape(html_url, quote=True)}\">{html.escape(title)}</a>")
+        else:
+            lines.append(f"• {html.escape(title)}")
+    await update.effective_message.reply_html("\n".join(lines), reply_markup=MAIN_KB, disable_web_page_preview=True)
+
+
 async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
@@ -687,8 +814,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
 
-    # ── 页码跳转状态机 ──────────────────────────────
+    # ── 交互状态机 ─────────────────────────────────
     state = context.user_data.get("await") if context.user_data else None
+    # ReplyKeyboard 菜单按钮优先级最高：点击菜单时取消正在等待的输入。
+    menu_texts = {
+        "📦 订阅列表", "📋 订阅列表", "订阅列表", "⏳ 临期列表", "🟠 临期列表",
+        "临期列表", "🔗 短链", "短链", "📦 导出", "📤 导出链接", "导出", "导出链接",
+        "🔄 更新所有", "更新所有", "🔢 重置编号", "重置编号", "♻️ 撤销删除", "撤销删除",
+        "🧭 路径对应", "路径对应", "❓ 帮助菜单", "帮助菜单", "帮助",
+    }
+    if state and text in menu_texts and context.user_data is not None:
+        context.user_data.pop("await", None)
+        state = None
+
+    if text.lower() in ("取消", "/cancel", "cancel", "退出"):
+        if state and context.user_data is not None:
+            context.user_data.pop("await", None)
+            await update.effective_message.reply_text("已取消当前操作。", reply_markup=MAIN_KB)
+            return
+
+    # ── 页码跳转状态机 ──────────────────────────────
     if state == "list_jump":
         context.user_data.pop("await", None)
         if not text.isdigit():
@@ -708,40 +853,61 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_html(text_out, reply_markup=kb, disable_web_page_preview=True)
         return
 
+    # ── 路径对应新增状态机 ─────────────────────────
+    if state == "path_add":
+        rule = parse_path_rule(text)
+        if rule is None:
+            # 保留等待状态，输错后可直接重试，不用重新点“添加对应”。
+            await update.effective_message.reply_text(PATH_ADD_PROMPT)
+            return
+        context.user_data.pop("await", None)
+        await store.upsert_path_map(user_id, *rule)
+        page_text, page_kb = await render_path_page(user_id)
+        await update.effective_message.reply_html(
+            f"✅ 已添加路径对应：<code>{html.escape(rule[0])}</code> → {html.escape(rule[1])}\n\n{page_text}",
+            reply_markup=page_kb,
+        )
+        return
+
     # ── /ai API 测试状态机 ─────────────────────────
     if state == "api_test":
         context.user_data.pop("await", None)
         results = []
         for line in text.splitlines():
             line = line.strip()
-            if not line or "|" not in line:
+            if not line:
                 continue
-            api_url, _, key = line.partition("|")
-            api_url = api_url.strip()
+            if "|" in line:
+                api_url, _, key = line.partition("|")
+            else:
+                parts = line.split()
+                api_url, key = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+            api_url = api_url.strip().rstrip("/")
             key = key.strip()
-            if not api_url or not key:
-                results.append(f"⚠️ 格式错误：{line[:40]}")
+            if not re.match(r"^https?://", api_url) or not key:
+                results.append("⚠️ 格式错误：请用 API地址|Key（每行一组）")
                 continue
+            # 兼容 OpenAI 兼容服务：优先探测 /v1/models，根地址则自动补路径。
+            probe_url = api_url if api_url.rstrip("/").endswith(("/models", "/chat/completions")) else api_url + "/v1/models"
             t0 = time.time()
             try:
                 timeout = aiohttp.ClientTimeout(total=15)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(
-                        api_url,
-                        headers={"Authorization": f"Bearer {key}"},
+                        probe_url,
+                        headers={"Authorization": f"Bearer {key}", "X-API-Key": key},
                     ) as resp:
                         elapsed = time.time() - t0
                         status = resp.status
-                        body_snippet = (await resp.text())[:80].replace("\n", " ")
-                if status == 200:
-                    results.append(f"✅ {api_url} → {status} ({elapsed:.1f}s) {body_snippet}")
-                else:
-                    results.append(f"❌ {api_url} → {status} ({elapsed:.1f}s) {body_snippet}")
+                        body = (await resp.text())[:120].replace("\n", " ")
+                # 不回显 Key；只展示状态、延迟和有限响应摘要。
+                mark = "✅" if 200 <= status < 300 else "❌"
+                results.append(f"{mark} {api_url} → HTTP {status} ({elapsed:.1f}s) {body}")
             except Exception as exc:
                 elapsed = time.time() - t0
                 results.append(f"❌ {api_url} → {type(exc).__name__} ({elapsed:.1f}s)")
         if not results:
-            await update.effective_message.reply_text("未解析到任何 地址|Key 组。", reply_markup=MAIN_KB)
+            await update.effective_message.reply_text("未解析到任何 API 地址和 Key。", reply_markup=MAIN_KB)
             return
         await update.effective_message.reply_text("\n".join(results[:20]), reply_markup=MAIN_KB)
         return
@@ -795,17 +961,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if "=" in text and not text.lower().startswith("http") and "://" not in text.split("=", 1)[0]:
-        left, right = text.split("=", 1)
-        node_name = left.strip()
-        remark = right.strip()
-        if not node_name:
-            await update.effective_message.reply_text("格式：节点名=备注")
+        rule = parse_path_rule(text)
+        if rule is None:
+            await update.effective_message.reply_text(PATH_ADD_PROMPT)
             return
-        await store.upsert_path_map(user_id, node_name, remark)
-        if remark:
-            await update.effective_message.reply_text(f"已设置：{node_name} = {remark}", reply_markup=MAIN_KB)
-        else:
-            await update.effective_message.reply_text(f"已清空：{node_name}", reply_markup=MAIN_KB)
+        await store.upsert_path_map(user_id, *rule)
+        page_text, page_kb = await render_path_page(user_id)
+        await update.effective_message.reply_html(
+            f"✅ 已设置路径对应：<code>{html.escape(rule[0])}</code> → {html.escape(rule[1])}\n\n{page_text}",
+            reply_markup=page_kb,
+        )
         return
 
     # name|url
@@ -939,6 +1104,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if context.user_data is not None:
             context.user_data["await"] = "list_jump"
         await q.message.reply_text("🔢 请输入要跳转的页码数字（如 2）。")
+        return
+    if data == "path:add":
+        if context.user_data is not None:
+            context.user_data["await"] = "path_add"
+        await q.message.reply_text(PATH_ADD_PROMPT)
+        return
+    if data.startswith("path:delete:"):
+        map_id = int(data.split(":")[-1])
+        deleted = await store.delete_path_map(user_id, map_id)
+        page_text, page_kb = await render_path_page(user_id)
+        prefix = "✅ 已删除路径对应。\n\n" if deleted else "❌ 路径对应不存在。\n\n"
+        with suppress(Exception):
+            await q.edit_message_text(prefix + page_text, parse_mode=ParseMode.HTML, reply_markup=page_kb)
         return
     if data == "list:updateall":
         subs = await store.list_subs(user_id)
@@ -1268,6 +1446,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("path", cmd_path))
     app.add_handler(CommandHandler("renumber", cmd_renumber))
     app.add_handler(CommandHandler("s", cmd_search))
+    app.add_handler(CommandHandler("g", cmd_github_search))
     app.add_handler(CommandHandler("o", cmd_search_export))
     app.add_handler(CommandHandler("d", cmd_delete_match))
     app.add_handler(CommandHandler("i", cmd_inline_sort))

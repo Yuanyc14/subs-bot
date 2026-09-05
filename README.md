@@ -21,7 +21,9 @@ Telegram 订阅管理机器人，复刻自 @MxlDYBot。
 | 导出节点 | 全部订阅聚合导出，支持分页 |
 | 临期列表 | 14 天内到期的订阅 |
 | 回收站 | 删除后 30 天可恢复 |
-| 路径对应 | 节点名→备注映射 |
+| 路径对应 | 关键词→配置名称映射，支持按钮新增/删除 |
+| GitHub 搜索 | `/g <关键词或链接>` 搜索公开代码 |
+| 内联查询 | `@bot 关键词` 返回当前用户的私有订阅结果 |
 | 短链服务 | `/s/{code}` 重定向 |
 | 临时节点 | 发送 ss:// 等分享链接加入临时列表 |
 
@@ -34,7 +36,8 @@ cd /opt/subs-bot
 
 # 2. 配置
 cp .env.example .env
-nano .env   # 填 BOT_TOKEN, ALLOWED_USER_IDS, PUBLIC_BASE_URL
+nano .env   # 填 BOT_TOKEN, BOT_USERNAME, ALLOWED_USER_IDS, PUBLIC_BASE_URL
+# 可选：GITHUB_TOKEN（提高 /g 搜索 API 限额）
 
 # 3. 一键部署（venv + systemd）
 ./deploy.sh

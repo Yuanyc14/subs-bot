@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parent
 _load_dotenv(ROOT / ".env")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "yyyjiediandy_bot").lstrip("@")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 ALLOWED_USER_IDS = {
     int(x.strip())
     for x in os.environ.get("ALLOWED_USER_IDS", "").split(",")

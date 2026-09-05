@@ -267,6 +267,14 @@ class Store:
             await db.commit()
             return cur.rowcount
 
+    async def delete_path_map(self, user_id: int, map_id: int) -> bool:
+        async with self.connection() as db:
+            cur = await db.execute(
+                "DELETE FROM path_maps WHERE user_id=? AND id=?", (user_id, map_id)
+            )
+            await db.commit()
+            return cur.rowcount > 0
+
     async def list_temp(self, user_id: int) -> list[dict[str, Any]]:
         async with self.connection() as db:
             cur = await db.execute(
