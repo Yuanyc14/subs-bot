@@ -5,6 +5,7 @@ import html
 import json
 import logging
 import re
+import time
 from contextlib import suppress
 from typing import Any
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.file import InputFile
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -220,9 +222,12 @@ def detail_keyboard(sub_id: int, page: int = 0) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}")],
             [
                 InlineKeyboardButton("📦 导出节点", callback_data=f"sub:nodes:{sub_id}"),
-                InlineKeyboardButton("🗑 删除订阅", callback_data=f"sub:del:{sub_id}:{page}"),
+                InlineKeyboardButton("🔗 生成短链", callback_data=f"sub:short:{sub_id}"),
             ],
-            [InlineKeyboardButton("⬅️ 返回列表", callback_data=f"sub:back:{page}")],
+            [
+                InlineKeyboardButton("🗑 删除订阅", callback_data=f"sub:delask:{sub_id}:{page}"),
+                InlineKeyboardButton("⬅️ 返回列表", callback_data=f"sub:back:{page}"),
+            ],
         ]
     )
 
@@ -241,10 +246,14 @@ def list_keyboard(page: int, total: int, page_size: int = 8, items: list[tuple[i
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"list:page:{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
+    nav.append(InlineKeyboardButton(f"📄 {page+1}/{pages}", callback_data="noop"))
     if page + 1 < pages:
         nav.append(InlineKeyboardButton("➡️", callback_data=f"list:page:{page+1}"))
     rows.append(nav)
+    rows.append([
+        InlineKeyboardButton("🔢 跳转页", callback_data="list:jump"),
+        InlineKeyboardButton("🔄 更新所有", callback_data="list:updateall"),
+    ])
     rows.append([InlineKeyboardButton("🏠 主菜单", callback_data="list:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -321,10 +330,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
-    import time as _time
-
     subs = await store.list_subs(update.effective_user.id)
-    now = int(_time.time())
+    now = int(time.time())
     soon = []
     for i, sub in enumerate(subs, start=1):
         exp = sub.get("expire_at")
@@ -338,15 +345,15 @@ async def cmd_expire(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=MAIN_KB,
         )
         return
-    lines = ["🟠 <b>临期列表</b>（14天内）\n"]
+    lines = [f"🟠 <b>临期列表</b> 共{len(soon)}个｜第1/1页\n"]
     for i, sub in soon:
-        lines.append(
-            f"#{i} <b>{html.escape(sub['name'])}</b>\n剩余: {html.escape(remain_text(sub.get('expire_at')))}"
-        )
-    await update.effective_message.reply_html("\n\n".join(lines), reply_markup=MAIN_KB)
+        remain = remain_traffic_gb(sub)
+        remain_s = f"{remain:.2f} GB" if remain is not None else "? GB"
+        lines.append(f"🟠 #{i} {html.escape(sub['name'])} [{remain_s}] {html.escape(remain_text(sub.get('expire_at')))}")
+    await update.effective_message.reply_html("\n".join(lines), reply_markup=MAIN_KB)
 
 
-async def cmd_refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_update_all_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
     user_id = update.effective_user.id
@@ -354,28 +361,87 @@ async def cmd_refresh_all(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not subs:
         await update.effective_message.reply_text("暂无订阅可更新。", reply_markup=MAIN_KB)
         return
-    msg = await update.effective_message.reply_text(f"🔄 开始更新 {len(subs)} 个订阅...")
-    ok = fail = renamed = 0
+    n = len(subs)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 确认更新", callback_data="upd:run"),
+            InlineKeyboardButton("❌ 取消", callback_data="upd:cancel"),
+        ]
+    ])
+    await update.effective_message.reply_text(
+        f"您是否要更新 {n} 条订阅？",
+        reply_markup=keyboard,
+    )
+
+
+async def run_update_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """执行批量更新，发送结果文件并统计失效订阅。"""
+    user_id = update.effective_user.id
+    subs = await store.list_subs(user_id)
+    valid, drained, expired, failed = [], [], [], []
     for sub in subs:
-        before = sub.get("name")
         updated = await refresh_sub(user_id, sub, rename=True)
         if updated.get("last_error"):
-            fail += 1
+            failed.append(updated)
+        elif updated.get("traffic_total") and remain_traffic_gb(updated) == 0:
+            drained.append(updated)
+        elif updated.get("expire_at") and int(updated["expire_at"]) < int(time.time()):
+            expired.append(updated)
         else:
-            ok += 1
-        if updated.get("name") and updated.get("name") != before:
-            renamed += 1
-    await msg.edit_text(f"✅ 更新完成：成功 {ok}，失败 {fail}，重命名 {renamed}")
+            valid.append(updated)
+    # 生成结果文件
+    def _fmt_rows(rows: list[dict[str, Any]]) -> str:
+        out = []
+        for s in rows:
+            out.append(f"#{s['id']} {s['name']} {s['url']}")
+        return "\n".join(out) or "(无)"
+    files = [
+        ("valid_subs.txt", f"有效订阅 ({len(valid)})\n{_fmt_rows(valid)}"),
+        ("failed_subs.txt", f"失效订阅 ({len(failed)})\n{_fmt_rows(failed)}"),
+        ("update_report.txt", (
+            f"更新完成\n有效: {len(valid)}\n耗尽: {len(drained)}\n"
+            f"过期: {len(expired)}\n失败: {len(failed)}"
+        )),
+    ]
+    for name, content in files:
+        doc = InputFile(content.encode("utf-8"), filename=name)
+        await context.bot.send_document(chat_id=user_id, document=doc)
+    stats = (
+        f"📊 更新完成\n有效: {len(valid)}\n耗尽: {len(drained)}\n"
+        f"过期: {len(expired)}\n失败: {len(failed)}"
+    )
+    if failed:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🗑 删除失效订阅", callback_data="upd:delfailed"),
+                InlineKeyboardButton("↩️ 暂不删除", callback_data="upd:keepfailed"),
+            ],
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:home"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ],
+        ])
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"{stats}\n\n检测到 {len(failed)} 条失效订阅，是否从订阅列表中删除？",
+            reply_markup=keyboard,
+        )
+    else:
+        await context.bot.send_message(chat_id=user_id, text=stats, reply_markup=MAIN_KB)
 
 
 async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await deny(update):
         return
     rows = await store.list_deleted(update.effective_user.id, days=30)
+    nav = [[
+        InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+        InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+    ]]
     if not rows:
         await update.effective_message.reply_text(
             "♻️ 订阅回收站为空，最近30天内没有可恢复的订阅。",
-            reply_markup=MAIN_KB,
+            reply_markup=InlineKeyboardMarkup(nav),
         )
         return
     lines = [f"♻️ <b>订阅回收站</b>（{len(rows)}）\n"]
@@ -388,6 +454,7 @@ async def cmd_recycle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 callback_data=f"recycle:restore:{int(row['id'])}",
             )
         ])
+    keyboard.append([InlineKeyboardButton("🏠 主菜单", callback_data="list:home")])
     await update.effective_message.reply_html(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -598,7 +665,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if text in ("📦 导出", "📤 导出链接", "导出", "导出链接"):
         return await cmd_export(update, context)
     if text in ("🔄 更新所有", "更新所有"):
-        return await cmd_refresh_all(update, context)
+        return await cmd_update_all_ask(update, context)
     if text in ("🔢 重置编号", "重置编号"):
         return await cmd_renumber(update, context)
     if text in ("♻️ 撤销删除", "撤销删除"):
@@ -764,6 +831,42 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "list:home":
         await q.message.reply_text("🏠 主菜单", reply_markup=MAIN_KB)
         return
+    if data == "list:jump":
+        await q.message.reply_text("🔢 请输入要跳转的页码数字（如 2）。")
+        return
+    if data == "list:updateall":
+        subs = await store.list_subs(user_id)
+        n = len(subs)
+        if not n:
+            await q.message.reply_text("暂无订阅可更新。", reply_markup=MAIN_KB)
+            return
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ 确认更新", callback_data="upd:run"),
+                InlineKeyboardButton("❌ 取消", callback_data="upd:cancel"),
+            ]
+        ])
+        await q.message.reply_text(f"您是否要更新 {n} 条订阅？", reply_markup=keyboard)
+        return
+    if data == "upd:cancel":
+        await q.edit_message_text("已取消更新。", reply_markup=MAIN_KB)
+        return
+    if data == "upd:run":
+        await q.edit_message_text("🔄 开始更新所有订阅…")
+        await run_update_all(update, context)
+        return
+    if data == "upd:keepfailed":
+        await q.edit_message_text("已保留失效订阅。", reply_markup=MAIN_KB)
+        return
+    if data == "upd:delfailed":
+        subs = await store.list_subs(user_id)
+        removed = 0
+        for sub in subs:
+            if sub.get("last_error"):
+                if await store.delete_sub(user_id, int(sub["id"])):
+                    removed += 1
+        await q.edit_message_text(f"✅ 已删除 {removed} 条失效订阅。", reply_markup=MAIN_KB)
+        return
     if data.startswith("list:page:"):
         page = int(data.split(":")[-1])
         text, kb = await render_list(user_id, page)
@@ -845,6 +948,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             disable_web_page_preview=True,
         )
         return
+    if data.startswith("sub:delask:"):
+        parts = data.split(":")
+        sub_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+        sub = await store.get_sub(user_id, sub_id)
+        if not sub:
+            await q.edit_message_text("订阅不存在")
+            return
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ 确认删除", callback_data=f"sub:del:{sub_id}:{page}"),
+                InlineKeyboardButton("❌ 取消", callback_data=f"sub:back:{page}"),
+            ]
+        ])
+        await q.edit_message_text(
+            f"确认删除订阅「{html.escape(sub['name'])}」？\n删除后 30 天内可在回收站恢复。",
+            reply_markup=keyboard,
+        )
+        return
     if data.startswith("sub:del:"):
         parts = data.split(":")
         sub_id = int(parts[2])
@@ -853,6 +975,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text, kb = await render_list(user_id, page)
         prefix = "✅ 已删除\n\n" if ok else "❌ 删除失败\n\n"
         await q.edit_message_text(prefix + text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        return
+    if data.startswith("sub:short:"):
+        sub_id = int(data.split(":")[-1])
+        sub = await store.get_sub(user_id, sub_id)
+        if not sub:
+            await q.message.reply_text("订阅不存在")
+            return
+        target = sub_token_url(sub["token"], "clash")
+        code = await store.create_short(user_id, target)
+        short = f"{PUBLIC_BASE_URL}/s/{code}"
+        await q.message.reply_html(
+            "🔗 <b>短链生成成功</b>\n"
+            f"🏷️ 原始机场名称：{html.escape(sub['name'])}\n"
+            f"🌐 原始订阅链接：{html.escape(sub['url'])}\n"
+            f"🌟 生成短链地址：{html.escape(short)}\n"
+            "📦 此短链会代理原始订阅，可直接导入客户端\n"
+            "⚠️ 注意部分机场无法代理访问，请先自行尝试",
+            disable_web_page_preview=True,
+        )
         return
     if data.startswith("sub:nodes:"):
         sub_id = int(data.split(":")[-1])
@@ -866,17 +1007,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not links:
             await q.message.reply_text("没有可导出的分享链接（可能来自 YAML 订阅）。")
             return
-        # split if too long
-        chunk = []
-        size = 0
-        for link in links:
-            if size + len(link) + 1 > 3500:
-                await q.message.reply_text("\n".join(chunk))
-                chunk, size = [], 0
-            chunk.append(link)
-            size += len(link) + 1
-        if chunk:
-            await q.message.reply_text("\n".join(chunk))
+        content = "\n".join(links)
+        doc = InputFile(content.encode("utf-8"), filename="Base64.txt")
+        await q.message.reply_document(document=doc, caption="📦 节点导出完成")
         return
 
 
