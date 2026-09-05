@@ -12,13 +12,22 @@ from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, InputFile, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    ReplyKeyboardMarkup,
+    InputFile,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -1191,6 +1200,63 @@ async def start_http(app: Application) -> web.AppRunner:
     return runner
 
 
+async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """内联查询：@bot 关键词 → 返回个人订阅/临时节点（is_personal 私有结果）。"""
+    iq = update.inline_query
+    if iq is None:
+        return
+    user_id = iq.from_user.id
+    if not allowed(user_id):
+        await iq.answer(
+            [],
+            cache_time=5,
+            switch_pm_text="此 Bot 需要授权使用",
+            switch_pm_parameter="denied",
+        )
+        return
+    q = (iq.query or "").strip().lower()
+    sort_mode = (context.user_data or {}).get("sort_mode", "默认")
+    subs = await store.list_subs(user_id)
+    if sort_mode == "流量":
+        subs.sort(key=lambda s: (s.get("traffic_total") or 0) - (s.get("traffic_used") or 0), reverse=True)
+    elif sort_mode == "到期":
+        subs.sort(key=lambda s: s.get("expire_at") or 99999999999)
+    elif sort_mode == "名称":
+        subs.sort(key=lambda s: str(s.get("name") or ""))
+    results: list[InlineQueryResultArticle] = []
+    for sub in subs:
+        blob = f"{sub['name']} {sub['url']}".lower()
+        if q and q not in blob:
+            continue
+        remain = remain_traffic_gb(sub)
+        remain_s = f"{remain:.2f}GB" if remain is not None else "?GB"
+        days = remain_text(sub.get("expire_at"))
+        if days == "长期有效":
+            days = "长期"
+        title = f"#{int(sub['id'])} {sub['name']} [{remain_s}] {days}"
+        results.append(
+            InlineQueryResultArticle(
+                id=f"s{int(sub['id'])}",
+                title=title[:64],
+                description=sub["url"][:100],
+                input_message_content=InputTextMessageContent(sub["url"]),
+            )
+        )
+    for t in await store.list_temp(user_id):
+        blob = f"{t['name']} {t['url']}".lower()
+        if q and q not in blob:
+            continue
+        results.append(
+            InlineQueryResultArticle(
+                id=f"t{int(t['id'])}",
+                title=f"🧪 {t['name']}"[:64],
+                description=t["url"][:100],
+                input_message_content=InputTextMessageContent(t["url"]),
+            )
+        )
+    await iq.answer(results[:50], cache_time=10, is_personal=True)
+
+
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1207,6 +1273,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("i", cmd_inline_sort))
     app.add_handler(CommandHandler("ai", cmd_api_test))
     app.add_handler(CommandHandler("temp", cmd_temp))
+    app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
